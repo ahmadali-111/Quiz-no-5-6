@@ -1,0 +1,236 @@
+name: "SVV — Validation Evidence Pipeline"
+
+# ──────────────────────────────────────────────────────────────
+# Trigger: every push to main/dev and every pull request to main
+# ──────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+# Cancel any in-progress run for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ============================================================
+  # JOB 1 — Static Code Analysis & Lint Validation
+  # ============================================================
+  static-analysis:
+    name: "Checkpoint 1 · Static Code Analysis"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      # Validation Gate 1 — ESLint
+      - name: Run ESLint (Static Validation)
+        run: |
+          mkdir -p reports/static
+          npx eslint . \
+            --format json \
+            --output-file reports/static/eslint-report.json || true
+          npx eslint . \
+            --format html \
+            --output-file reports/static/eslint-report.html || true
+
+      # Validation Gate 2 — Dependency Audit
+      - name: Dependency Security Audit
+        run: npm audit --audit-level=high --json > reports/static/npm-audit.json || true
+
+      - name: Upload Static Analysis Evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-analysis-evidence
+          path: reports/static/
+          retention-days: 90
+
+  # ============================================================
+  # JOB 2 — Functional Validation Tests
+  # ============================================================
+  functional-validation:
+    name: "Checkpoint 2 · Functional Validation Tests"
+    runs-on: ubuntu-latest
+    needs: static-analysis
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      # Validation Gate 3 — Unit & Integration Tests
+      - name: Run Validation Test Suite
+        run: |
+          mkdir -p reports/tests
+          npx jest \
+            --coverage \
+            --coverageDirectory=reports/tests/coverage \
+            --coverageReporters=html lcov text \
+            --reporters=default jest-junit \
+            --forceExit
+        env:
+          CI: true
+          JEST_JUNIT_OUTPUT_DIR: reports/tests
+          JEST_JUNIT_OUTPUT_NAME: junit-results.xml
+
+      # Validation Gate 4 — Coverage Threshold Check
+      - name: Enforce Coverage Threshold (≥ 90%)
+        run: |
+          npx jest \
+            --coverage \
+            --coverageThreshold='{"global":{"lines":90,"branches":85,"functions":90,"statements":90}}' \
+            --forceExit
+        env:
+          CI: true
+
+      - name: Upload Functional Test Evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: functional-test-evidence
+          path: reports/tests/
+          retention-days: 90
+
+  # ============================================================
+  # JOB 3 — Security Validation (OWASP ZAP)
+  # ============================================================
+  security-validation:
+    name: "Checkpoint 3 · Security Validation (OWASP ZAP)"
+    runs-on: ubuntu-latest
+    needs: functional-validation
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Create Reports Directory
+        run: mkdir -p reports/security
+
+      # Validation Gate 5 — OWASP ZAP Baseline (Passive) Scan
+      - name: OWASP ZAP Passive Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-a"
+          artifact_name: "zap-baseline-report"
+          fail_action: false
+
+      # Validation Gate 6 — OWASP ZAP Full (Active) Scan
+      - name: OWASP ZAP Full Active Scan
+        uses: zaproxy/action-full-scan@v0.10.0
+        with:
+          target: ${{ vars.STAGING_URL }}
+          rules_file_name: ".zap/rules.tsv"
+          artifact_name: "zap-full-scan-report"
+          fail_action: false
+        continue-on-error: true
+
+      - name: Upload ZAP Security Evidence
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-validation-evidence
+          path: |
+            report_html.html
+            report_xml.xml
+            reports/security/
+          retention-days: 90
+
+  # ============================================================
+  # JOB 4 — Compliance Report Compilation
+  # ============================================================
+  compliance-report:
+    name: "Checkpoint 4 · Compliance Evidence Compilation"
+    runs-on: ubuntu-latest
+    needs: [static-analysis, functional-validation, security-validation]
+    if: always()
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Download all prior evidence artifacts
+      - name: Download Static Analysis Evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: static-analysis-evidence
+          path: all-evidence/static/
+
+      - name: Download Functional Test Evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: functional-test-evidence
+          path: all-evidence/tests/
+
+      - name: Download Security Evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: security-validation-evidence
+          path: all-evidence/security/
+        continue-on-error: true
+
+      # Validation Gate 7 — Compile Summary Report
+      - name: Generate Compliance Summary Report
+        run: |
+          mkdir -p all-evidence/summary
+          cat <<EOF > all-evidence/summary/compliance-summary.md
+          # SVV Compliance Evidence Report
+          **Run ID**: ${{ github.run_id }}
+          **Commit SHA**: ${{ github.sha }}
+          **Branch**: ${{ github.ref_name }}
+          **Triggered by**: ${{ github.actor }}
+          **Timestamp**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          ## Validation Checkpoints Status
+          | Checkpoint | Status |
+          |---|---|
+          | Static Code Analysis (ESLint) | ${{ needs.static-analysis.result }} |
+          | Functional Validation Tests   | ${{ needs.functional-validation.result }} |
+          | Security Validation (ZAP)     | ${{ needs.security-validation.result }} |
+
+          ## Evidence Artifacts
+          - Static: eslint-report.html, npm-audit.json
+          - Tests: junit-results.xml, coverage/index.html
+          - Security: report_html.html, report_xml.xml
+
+          ## Sign-off
+          This report was auto-generated by GitHub Actions as part of the
+          continuous validation evidence pipeline for audit compliance.
+          EOF
+
+      - name: Upload Consolidated Compliance Evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: "compliance-evidence-${{ github.run_id }}"
+          path: all-evidence/
+          retention-days: 365   # Keep compliance evidence for 1 year
+
+      # Validation Gate 8 — Notify on Failure
+      - name: Notify Validation Failure
+        if: |
+          needs.static-analysis.result == 'failure' ||
+          needs.functional-validation.result == 'failure'
+        run: |
+          echo "::error::VALIDATION PIPELINE FAILED — Review evidence artifacts before deployment."
+          exit 1
